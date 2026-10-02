@@ -18,10 +18,13 @@
 硬约束：
 
   1. 物理可行性——插头只能插向当前空闲插孔（T 对输出、B 对输入）；
-  2. 每一步完成后，所有**保护路由**在当前插头状态推导出的物理图上仍有
-     source → target 完整通路（设备内部 + 生效常态 + 在役跳线）。全常态
-     任一侧插线断常态、半常态仅下孔插线断常态（上孔插线并送）、直通无
-     常态——全部由插头状态直接推导；
+  2. 每个**插 / 拔动作完成后的中间快照**（一个宏步骤恰含两个动作）上，所有
+     **保护路由**在当前插头状态推导出的物理图上都仍有 source → target 完整
+     通路（设备内部 + 生效常态 + 在役跳线）。注意换接时“先拔旧端、悬空的另
+     一端仍插着”这一瞬间跳线不成回路，保护路由会失声——这类顺序直接拒绝；
+     补线 / 拆线两个动作先后可换序时，搜索会选取**两个中间快照都通声**的
+     执行次序。全常态任一侧插线断常态、半常态仅下孔插线断常态（上孔插线
+     并送）、直通无常态——全部由插头状态直接推导；
   3. 目标配置非法（含目标路由无解）时直接 400，不产生任何步骤；
   4. 找不到满足约束的顺序时 409，返回结构化阻塞原因（占用死锁插孔、
      必断常态 / 必拆跳线、无空闲旁路插孔等），同样不给出半成品步骤。
@@ -86,10 +89,22 @@ class PhysModel:
 
     @staticmethod
     def plug_set(conns):
-        plugs = set()
+        return PhysModel.plugs_from(conns, ())
+
+    @staticmethod
+    def plugs_from(conns, pending):
+        """完整连接集 + 悬空插头占用的插孔 → 当前插头占用集合。
+
+        换接动作的中间快照里跳线一端已拔下悬空（另一端以 None 占位）：仍插在
+        面板上的那一端继续占用插孔，悬空端不占任何插孔。pending 给出“只插了
+        一端、尚未成型 / 即将拔出”的插头额外占用的插孔。
+        """
+        plugs = set(pending)
         for t, b in conns:
-            plugs.add(t)
-            plugs.add(b)
+            if t is not None:
+                plugs.add(t)
+            if b is not None:
+                plugs.add(b)
         return plugs
 
     def active_normal_ids(self, plugs):
@@ -106,11 +121,13 @@ class PhysModel:
                 ids.add(p["id"])
         return ids
 
-    def trace(self, conns, src, dst, allow_edge=None):
+    def trace(self, conns, src, dst, allow_edge=None, plugs=None):
         """求 src→dst 有向最短通路。
 
-        conns:      frozenset((tJack, bJack)) 当前在役跳线；
+        conns:      frozenset((tJack, bJack)) 当前在役跳线（含只插了一端时，
+                    悬空那端以 None 占位，不成回路）；
         allow_edge: 额外允许的一条候选跳线 (tJack, bJack)，两端须当前空闲；
+        plugs:      显式插头占用集合（中间快照），缺省由 conns 推导；
         返回 (端口列表, 边列表) 或 None。边形如：
           ("device", name) / ("normal", pair_id) /
           ("cable", tJack, bJack, is_extra)
@@ -118,9 +135,10 @@ class PhysModel:
         注意：候选边插上后可能断开其插孔所在对的常态，此处按“未插”估算，
         是否真的成立由调用方在完整状态上用 audible() 复核。
         """
-        plugs = self.plug_set(conns)
+        if plugs is None:
+            plugs = self.plugs_from(conns, ())
         active = self.active_normal_ids(plugs)
-        tmap = {t: b for t, b in conns}
+        tmap = {t: b for t, b in conns if b is not None}
         extra = None
         if allow_edge:
             et, eb = allow_edge
@@ -151,10 +169,16 @@ class PhysModel:
                 ju = self.jack_of_port.get(u)
                 if ju and ju in tmap:
                     jv = tmap[ju]
-                    cands.append((self.port_of_jack[jv], ("cable", ju, jv, False)))
+                    vp = self.port_of_jack.get(jv)
+                    if vp is not None:
+                        cands.append((vp, ("cable", ju, jv, False)))
                 if extra and ju == extra[0] and n_extra == 0:
                     jv = extra[1]
-                    cands.append((self.port_of_jack[jv], ("cable", ju, jv, True)))
+                    vp = self.port_of_jack.get(jv)
+                    # 面板上可能存在未接背板的空插孔（top/bottom 缺一侧），
+                    # 插上去也到不了任何设备端口，不能构成候选边
+                    if vp is not None:
+                        cands.append((vp, ("cable", ju, jv, True)))
             for v, edge in cands:
                 nd = (n_extra + (1 if len(edge) == 4 and edge[3] else 0), hops + 1)
                 if nd < dist.get(v, INF):
@@ -176,6 +200,15 @@ class PhysModel:
 
     def audible(self, conns, src, dst):
         return self.trace(conns, src, dst) is not None
+
+    def audible_micro(self, conns, pending, src, dst):
+        """中间快照通声校验：conns 含悬空单端（None 占位），pending 为额外占用。"""
+        plugs = self.plugs_from(conns, pending)
+        return self.trace(conns, src, dst, plugs=plugs) is not None
+
+    def trace_micro(self, conns, pending, src, dst):
+        plugs = self.plugs_from(conns, pending)
+        return self.trace(conns, src, dst, plugs=plugs)
 
     def bypass_candidates(self, conns, src, dst, goal_free_jacks):
         """枚举“目标态空闲、当前也空闲”插孔组成的临时旁路候选。
@@ -330,9 +363,9 @@ def seamless_rewire(config, target_routes_raw, protected_raw):
 
     # ---- 5. 搜索 --------------------------------------------------------
     tgt_keys_all = [(_pid(r["source"]), _pid(r["target"])) for r in tgt_plan["routes"]]
-    actions, inconclusive, note, blockers = _search(
+    chain, inconclusive, note, blockers = _search(
         phys, init_conns, goal_conns, protected_info, goal_free, tgt_keys_all)
-    if actions is None:
+    if chain is None:
         raise SeamlessConflict(
             "不存在能保持保护路由连续通声的改线顺序",
             _conflict_payload(protected_info, cur_result, tgt_result,
@@ -340,7 +373,7 @@ def seamless_rewire(config, target_routes_raw, protected_raw):
                               inconclusive=inconclusive, note=note))
 
     # ---- 6. 回放并构造报告 ----------------------------------------------
-    return _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, actions,
+    return _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, chain,
                    protected_info, goal_free, note)
 
 
@@ -374,12 +407,77 @@ def _apply(conns, temps, action):
     return frozenset(new), frozenset(nt)
 
 
-def _safe(phys, conns, pr_keys):
-    return all(phys.audible(conns, src, dst) for src, dst in pr_keys)
+# 每个宏动作恰含两个插/拔动作。下面用 (conns, pending) 描述任一动作完成后的
+# 中间快照：conns 为在役跳线连接集（悬空单端以 None 占位），pending 为该瞬间
+# 额外占用插孔的插头。换接（complete/park）只能“先拔后插”，次序唯一；
+# 补线/拆线两动作可换序，故各生成两个候选次序。
+def micro_states(conns, action):
+    """返回中间快照列表：每项 ((new_conns, pending), (jack, change))。
+
+    换接返回 2 项（唯一“先拔后插”次序），补线 / 拆线各返回 4 项：
+    前 2 项为次序 0（补线先插上孔 / 拆线先拔下孔），后 2 项为次序 1
+    （补线先插下孔 / 拆线先拔上孔）。
+    """
+    kind, c, end, j = action
+    base = set(conns or ())
+    if kind in ("complete", "park"):
+        formed = (c[0], j) if end == "B" else (j, c[1])
+        if end == "B":
+            dangling = (c[0], None)                 # 上端仍插，下端悬空
+            old_jack, new_jack = c[1], j
+        else:
+            dangling = (None, c[1])                 # 下端仍插，上端悬空
+            old_jack, new_jack = c[0], j
+        mid = frozenset(base - {c} | {dangling})
+        fin = frozenset(base - {c} | {formed})
+        return [
+            ((mid, frozenset()), (old_jack, "unplug")),
+            ((fin, frozenset()), (new_jack, "plug")),
+        ]
+    if kind in ("add", "temp-add"):
+        with_c = frozenset(base | {c})
+        return [
+            ((frozenset(base), frozenset((c[0],))), (c[0], "plug")),   # 次序0：先插上孔
+            ((with_c, frozenset()), (c[1], "plug")),
+            ((frozenset(base), frozenset((c[1],))), (c[1], "plug")),   # 次序1：先插下孔
+            ((with_c, frozenset()), (c[0], "plug")),
+        ]
+    # remove / temp-remove（对象总是完整双端连接）
+    without_c = frozenset(base - {c})
+    t_dangling = frozenset(base - {c} | {(c[0], None)})
+    b_dangling = frozenset(base - {c} | {(None, c[1])})
+    return [
+        ((b_dangling, frozenset()), (c[1], "unplug")),   # 次序0：先拔下孔
+        ((without_c, frozenset()), (c[0], "unplug")),
+        ((t_dangling, frozenset()), (c[0], "unplug")),   # 次序1：先拔上孔
+        ((without_c, frozenset()), (c[1], "unplug")),
+    ]
+
+
+def _micro_sequences(conns, action):
+    """把中间快照按执行次序分组：换接 1 个次序，补线/拆线 2 个次序。"""
+    states = micro_states(conns, action)
+    if action[0] in ("complete", "park"):
+        return [[states[0], states[1]]]
+    return [[states[0], states[1]], [states[2], states[3]]]
+
+
+def _micro_safe(phys, snap, pr_keys):
+    cn, pending = snap
+    return all(phys.audible_micro(cn, pending, s, d) for s, d in pr_keys)
+
+
+def safe_orders(phys, conns, temps, action, pr_keys):
+    """返回动作所有“每个中间快照保护路由都通声”的次序编号（0 优先于 1）。"""
+    return [order for order, seq in enumerate(_micro_sequences(conns, action))
+            if all(_micro_safe(phys, snap, pr_keys) for snap, _ in seq)]
 
 
 def _search(phys, init_conns, goal_conns, protected_info, goal_free, tgt_keys):
-    """确定性 Dijkstra。返回 (actions, inconclusive, note, blockers)。"""
+    """确定性 Dijkstra。返回 (chain, inconclusive, note, blockers)。
+
+    chain 为 [(action, order), ...]，order 是该宏动作选定的插/拔执行次序。
+    """
     pr_keys = [(p["source"], p["target"]) for p in protected_info]
     blockers = {}
 
@@ -442,18 +540,19 @@ def _search(phys, init_conns, goal_conns, protected_info, goal_free, tgt_keys):
         for c in sorted(conns - goal_conns):
             acts.append(("temp-remove" if c in temps else "remove", c, None, None))
 
-        # 只在没有安全的推进 / 让位动作时，才为“受威胁”的保护路由寻找临时旁路
+        # 只在没有安全的推进 / 让位动作时，才为“受威胁”的保护路由寻找临时旁路。
+        # “安全”按每个插/拔动作后的中间快照判定（而非宏步骤完成后的终态）。
         if allow_temp:
             base_acts = [a for a in acts if a[0] in ("complete", "add", "remove", "park")]
             safe_exists = any(
-                _safe(phys, _apply(conns, temps, a)[0], pr_keys) for a in base_acts)
+                safe_orders(phys, conns, temps, a, pr_keys) for a in base_acts)
             if not safe_exists:
                 threatened = []
                 for p in protected_info:
                     src, dst = p["source"], p["target"]
                     if not phys.audible(conns, src, dst):
                         continue
-                    if any(not _safe(phys, _apply(conns, temps, a)[0], [(src, dst)])
+                    if any(not safe_orders(phys, conns, temps, a, [(src, dst)])
                            for a in base_acts):
                         threatened.append(p)
                 if not threatened and base_acts:
@@ -478,43 +577,62 @@ def _search(phys, init_conns, goal_conns, protected_info, goal_free, tgt_keys):
         return acts
 
     def record_unsafe(conns, temps, action):
-        new_conns, _ = _apply(conns, temps, action)
-        inserted = []
-        if action[0] in ("complete", "park"):
-            inserted = [action[3]]
-        elif action[0] in ("add", "temp-add"):
-            inserted = [action[1][0], action[1][1]]
-        for p in protected_info:
-            src, dst = p["source"], p["target"]
-            if phys.audible(new_conns, src, dst):
-                continue
-            old = phys.trace(conns, src, dst)
-            if old is None:
-                continue
-            for e in old[1]:
-                if e[0] == "cable" and (e[1], e[2]) not in new_conns:
-                    is_temp = (e[1], e[2]) in temps
-                    record({
-                        "type": "must-remove-cable",
-                        "message": f"保护路由 {p['index'] + 1}（{src} → {dst}）当前经由跳线 "
-                                   f"{e[1]}→{e[2]}" + ("（临时旁路）" if is_temp else "") +
-                                   "，但该跳线必须在替代通路建立前拆动",
-                        "route": p["index"], "source": src, "target": dst,
-                        "cable": [e[1], e[2]], "temporary": is_temp,
-                    }, ("cable", p["index"], e[1], e[2]))
-                elif e[0] == "normal":
-                    pid = e[1]
-                    hit = [x for x in inserted if int(x[:-1]) == pid]
-                    if hit:
-                        pair = phys.pair_of[f"{pid}T"]
-                        record({
-                            "type": "must-break-normal",
-                            "message": f"保护路由 {p['index'] + 1}（{src} → {dst}）依赖第 {pid} 对"
-                                       f"（{MODE_LABELS[pair['mode']]}）常态，向 {hit[0]} 插线会"
-                                       "断开它，且该步没有能保持通声的替代通路 / 旁路",
-                            "route": p["index"], "source": src, "target": dst,
-                            "pair": pid, "plugJack": hit[0],
-                        }, ("normal", p["index"], pid, hit[0]))
+        """动作的任一执行次序存在失声的中间快照时，记录结构化阻塞原因。
+
+        依次回放该动作的两个候选次序（换接只有一个），对每个中间快照判断
+        保护路由失声的原因：跳线被拔到悬空（must-remove-cable）或插入插头
+        断开其依赖的常态（must-break-normal）。
+        """
+        seen_keys = set()
+
+        def emit(rec, key):
+            if key not in seen_keys:
+                seen_keys.add(key)
+                record(rec, key)
+
+        for order, seq in enumerate(_micro_sequences(conns, action)):
+            prev_snap = (conns, frozenset())
+            for snap, change in seq:
+                new_conns, pending = snap
+                jack, change_kind = change
+                for p in protected_info:
+                    src, dst = p["source"], p["target"]
+                    if phys.audible_micro(new_conns, pending, src, dst):
+                        continue
+                    old = phys.trace_micro(prev_snap[0], prev_snap[1], src, dst)
+                    if old is None:
+                        continue
+                    for e in old[1]:
+                        if e[0] == "cable":
+                            # 完整双端连接已不在 conns（含悬空单端）即视为被拆动：
+                            # “一端悬空、跳线不成回路”正是换接/拆线中间失声的情形
+                            intact = (e[1], e[2]) in new_conns
+                            if intact:
+                                continue
+                            is_temp = (e[1], e[2]) in temps
+                            emit({
+                                "type": "must-remove-cable",
+                                "message": f"保护路由 {p['index'] + 1}（{src} → {dst}）当前经由跳线 "
+                                           f"{e[1]}→{e[2]}" + ("（临时旁路）" if is_temp else "") +
+                                           "，但该跳线必须在替代通路建立前拆动（拔下一端后的"
+                                           "中间瞬间跳线不成回路、路由即失声）",
+                                "route": p["index"], "source": src, "target": dst,
+                                "cable": [e[1], e[2]], "temporary": is_temp,
+                            }, ("cable", p["index"], e[1], e[2]))
+                        elif e[0] == "normal":
+                            pid = e[1]
+                            if int(jack[:-1]) != pid or change_kind != "plug":
+                                continue
+                            pair = phys.pair_of[f"{pid}T"]
+                            emit({
+                                "type": "must-break-normal",
+                                "message": f"保护路由 {p['index'] + 1}（{src} → {dst}）依赖第 {pid} 对"
+                                           f"（{MODE_LABELS[pair['mode']]}）常态，向 {jack} 插入插头的"
+                                           "瞬间就会断开它，且该动作没有能保持通声的替代通路 / 旁路",
+                                "route": p["index"], "source": src, "target": dst,
+                                "pair": pid, "plugJack": jack,
+                            }, ("normal", p["index"], pid, jack))
+                prev_snap = snap
 
     dist = {init_conns: 0}
     temps_at = {init_conns: frozenset()}
@@ -549,14 +667,15 @@ def _search(phys, init_conns, goal_conns, protected_info, goal_free, tgt_keys):
         acts.sort(key=lambda a: (PRIORITY[a[0]], _action_key(a)))
         for a in acts:
             new_conns, new_temps = _apply(conns, temps_at[conns], a)
-            if not _safe(phys, new_conns, pr_keys):
+            orders = safe_orders(phys, conns, temps_at[conns], a, pr_keys)
+            if not orders:
                 record_unsafe(conns, temps_at[conns], a)
                 continue
             nd = d + 1
             if nd < dist.get(new_conns, 1 << 30):
                 dist[new_conns] = nd
                 temps_at[new_conns] = new_temps
-                parent[new_conns] = (conns, a)
+                parent[new_conns] = (conns, a, orders[0])  # 选最靠前的安全次序
                 counter += 1
                 heappush(pq, (nd, counter, new_conns))
 
@@ -565,8 +684,8 @@ def _search(phys, init_conns, goal_conns, protected_info, goal_free, tgt_keys):
 
     chain, c = [], goal_node
     while parent[c] is not None:
-        prev_c, a = parent[c]
-        chain.append(a)
+        prev_c, a, order = parent[c]
+        chain.append((a, order))
         c = prev_c
     chain.reverse()
     return chain, False, None, blockers
@@ -620,8 +739,15 @@ def _path_touches(trace, touched_pairs, touched_conns):
     return False
 
 
-def _snapshot(pairs, conns, label_of, jack_port):
-    plugs = PhysModel.plug_set(conns)
+def _snapshot(pairs, conns, label_of, jack_port, pending=(), pending_labels=()):
+    """构造一次插/拔动作后面板快照。
+
+    conns 允许悬空单端（另一端为 None）——该端此刻在操作员手中、不接任何
+    插孔；pending 为只插了一端、尚未成型的插头额外占用的插孔；pending_labels
+    给出这些待成型插头 ((jack, label), ...)，snapshot.pendingPlugs 供前端
+    画出“刚插上、悬空的另一只手还没插”的插头。
+    """
+    plugs = PhysModel.plugs_from(conns, pending)
     pair_out = []
     for p in pairs:
         t, b = f"{p['id']}T", f"{p['id']}B"
@@ -639,17 +765,27 @@ def _snapshot(pairs, conns, label_of, jack_port):
             "normalActive": active,
         })
     cables = []
-    for conn in sorted(conns):
-        lab = label_of.get(conn)
+    attached = set()
+    for conn in sorted(conns, key=lambda x: (x[0] or "", x[1] or "")):
+        lab = label_of.get(conn) or label_of.get((conn[0], None)) \
+            or label_of.get((None, conn[1]))
         if lab is None:
             continue
         kind, cid = lab
         cables.append({"id": cid, "fromJack": conn[0], "toJack": conn[1],
-                       "fromPort": jack_port.get(conn[0]),
-                       "toPort": jack_port.get(conn[1]),
-                       "temporary": kind == "temp"})
+                       "fromPort": jack_port.get(conn[0]) if conn[0] else None,
+                       "toPort": jack_port.get(conn[1]) if conn[1] else None,
+                       "temporary": kind == "temp",
+                       "dangling": conn[0] is None or conn[1] is None})
+        attached.update(x for x in conn if x)
     cables.sort(key=lambda c: c["id"])
-    return {"pairs": pair_out, "cables": cables}
+    pending_out = [
+        {"jack": jk, "port": jack_port.get(jk),
+         "label": _label_text(lab), "temporary": lab[0] == "temp",
+         "id": lab[1]}
+        for jk, lab in pending_labels if jk in plugs and jk not in attached
+    ]
+    return {"pairs": pair_out, "cables": cables, "pendingPlugs": pending_out}
 
 
 def _label_text(lab):
@@ -661,7 +797,7 @@ def _label_text(lab):
     return f"跳线 #{cid}"
 
 
-def _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, actions,
+def _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, chain,
             protected_info, goal_free, note):
     s0, st = cur_plan["solver"], tgt_plan["solver"]
     jack_port = dict(s0.jack_port)
@@ -684,21 +820,17 @@ def _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, actions,
     prev_traces = _trace_map(phys, conns, routes)
     steps = []
 
-    for seq, action in enumerate(actions, 1):
+    for seq, (action, order) in enumerate(chain, 1):
         kind, c, end, j = action
         old_conns = conns
-        jack_changes, touched_conns, formed = [], {c}, None
 
+        # ---- 跳线标签 / 复用簿记（先于动作更新，供中间快照取名）----------
+        formed = None
         if kind in ("complete", "park"):
             lab = label_of.pop(c)
             formed = (c[0], j) if end == "B" else (j, c[1])
             label_of[formed] = lab
             moved = c[1] if end == "B" else c[0]
-            jack_changes = [
-                {"jack": moved, "port": jack_port.get(moved), "change": "unplug"},
-                {"jack": j, "port": jack_port.get(j), "change": "plug"},
-            ]
-            touched_conns.add(formed)
             end_cn = "下端 B" if end == "B" else "上端 T"
             summary = (f"{_label_text(lab)} 保持插接"
                        + ("（临时让位）" if kind == "park" else "")
@@ -723,11 +855,6 @@ def _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, actions,
                 lab = ("new", next_new)
                 next_new += 1
             label_of[c] = lab
-            jack_changes = [
-                {"jack": c[0], "port": jack_port.get(c[0]), "change": "plug"},
-                {"jack": c[1], "port": jack_port.get(c[1]), "change": "plug"},
-            ]
-            formed = c
             summary = (f"{_label_text(lab)}：{c[0]}（{jack_port.get(c[0])}） ↔ "
                        f"{c[1]}（{jack_port.get(c[1])}）"
                        + ("（临时旁路，替代通路建立后拆除）" if kind == "temp-add"
@@ -742,16 +869,89 @@ def _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, actions,
             else:
                 spare.append(lab[1])
                 spare.sort()
-            jack_changes = [
-                {"jack": c[0], "port": jack_port.get(c[0]), "change": "unplug"},
-                {"jack": c[1], "port": jack_port.get(c[1]), "change": "unplug"},
-            ]
             summary = (f"拆除{_label_text(lab)}：拔下 {c[0]}（{jack_port.get(c[0])}）"
                        f"与 {c[1]}（{jack_port.get(c[1])}）")
             action_label = "拆除临时旁路跳线" if is_temp else "拆线"
 
-        conns, _temps = _apply(old_conns, frozenset(), action)
-        touched_pairs = {int(jc["jack"][:-1]) for jc in jack_changes}
+        # ---- 按搜索选定的执行次序，逐步回放两个插/拔动作 -----------------
+        seq_micro = _micro_sequences(old_conns, action)[order]
+        jack_changes, micro_ops = [], []
+        touched_pairs, touched_conns = set(), {c}
+        if formed is not None:
+            touched_conns.add(formed)
+
+        # 中间快照里“已脱离 label_of 但仍在物理上可见”的跳线标签：
+        # 换接悬空端、拆线悬空端、补线待成型插头（标签在动作开始前已从
+        # label_of 摘下，故这里单独补回供中间快照取名）
+        micro_extra = []
+        if kind in ("complete", "park"):
+            micro_extra = [((c[0], None), lab), ((None, c[1]), lab)]
+        elif kind in ("add", "temp-add"):
+            micro_extra = [((c[0], c[1]), lab)]
+        else:  # remove / temp-remove
+            micro_extra = [(c, lab), ((c[0], None), lab), ((None, c[1]), lab)]
+
+        def pending_labels_for(mp):
+            out = []
+            for jk in mp:
+                for key, l in micro_extra:
+                    if jk in key:
+                        out.append((jk, l))
+                        break
+            return out
+
+        def extra_labels_for(mc):
+            return [(k, l) for (k, l) in micro_extra if k in mc]
+
+        def protected_status_at(mc, mp):
+            status = []
+            for p in protected_info:
+                tr = phys.trace_micro(mc, mp, p["source"], p["target"])
+                uses_temp = []
+                if tr:
+                    for e in tr[1]:
+                        if e[0] == "cable":
+                            lab_e = label_of.get((e[1], e[2]))
+                            if lab_e and lab_e[0] == "temp":
+                                uses_temp.append(lab_e[1])
+                                temp_use.setdefault(lab_e[1], set()).add(p["index"])
+                status.append({
+                    "index": p["index"], "routeNo": p["index"] + 1,
+                    "source": p["source"], "target": p["target"],
+                    "audible": tr is not None,
+                    "viaTemporary": sorted(set(uses_temp)),
+                    "path": None if tr is None else [
+                        {"port": pp, "jack": phys.jack_of_port.get(pp)} for pp in tr[0]],
+                })
+            return status
+
+        for op_no, ((mc, mp), (jk, change)) in enumerate(seq_micro, 1):
+            jack_changes.append({
+                "jack": jk, "port": jack_port.get(jk), "change": change,
+                "order": op_no,
+            })
+            touched_pairs.add(int(jk[:-1]))
+            status = protected_status_at(mc, mp)
+            # 防御性校验：搜索已保证每个中间快照安全，此处再次复核
+            if any(not x["audible"] for x in status):
+                raise RewireError(
+                    f"第 {seq} 步第 {op_no} 个插/拔动作（{change} {jk}）后的中间"
+                    "快照上保护路由失声：搜索与回放结果不一致",
+                    code="REWIRE_INCONSISTENT",
+                    details={"step": seq, "op": op_no, "jack": jk,
+                             "change": change})
+            micro_ops.append({
+                "op": op_no, "jack": jk, "port": jack_port.get(jk),
+                "change": change,
+                "protected": status,
+                "protectedAllAudible": all(x["audible"] for x in status),
+                "snapshot": _snapshot(pairs, mc,
+                                      {**dict(label_of), **dict(extra_labels_for(mc))},
+                                      jack_port, pending=mp,
+                                      pending_labels=pending_labels_for(mp)),
+            })
+
+        conns = _apply(old_conns, frozenset(), action)[0]
 
         new_aud = _audible_map(phys, conns, routes)
         new_traces = _trace_map(phys, conns, routes)
@@ -772,26 +972,6 @@ def _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, actions,
                                      x["currentIndex"] if x["currentIndex"] is not None else 0,
                                      x["targetIndex"] if x["targetIndex"] is not None else 0))
 
-        protected_status = []
-        for p in protected_info:
-            tr = phys.trace(conns, p["source"], p["target"])
-            uses_temp = []
-            if tr:
-                for e in tr[1]:
-                    if e[0] == "cable":
-                        lab_e = label_of.get((e[1], e[2]))
-                        if lab_e and lab_e[0] == "temp":
-                            uses_temp.append(lab_e[1])
-                            temp_use.setdefault(lab_e[1], set()).add(p["index"])
-            protected_status.append({
-                "index": p["index"], "routeNo": p["index"] + 1,
-                "source": p["source"], "target": p["target"],
-                "audible": tr is not None,
-                "viaTemporary": sorted(set(uses_temp)),
-                "path": None if tr is None else [
-                    {"port": pp, "jack": phys.jack_of_port.get(pp)} for pp in tr[0]],
-            })
-
         steps.append({
             "seq": seq, "action": kind, "actionLabel": action_label,
             "summary": summary,
@@ -803,10 +983,11 @@ def _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, actions,
                 "label": _label_text(label_of.get(formed, lab)),
             },
             "jackChanges": jack_changes,
+            "microOps": micro_ops,
             "affectedRoutes": affected,
-            "protected": protected_status,
-            "protectedAllAudible": all(x["audible"] for x in protected_status),
-            "snapshot": _snapshot(pairs, conns, label_of, jack_port),
+            "protected": micro_ops[-1]["protected"],
+            "protectedAllAudible": micro_ops[-1]["protectedAllAudible"],
+            "snapshot": micro_ops[-1]["snapshot"],
         })
         prev_aud, prev_traces = new_aud, new_traces
 
@@ -866,11 +1047,11 @@ def _replay(phys, cur_plan, tgt_plan, init_conns, goal_conns, actions,
         "stepCount": len(steps),
         "metrics": {
             "plugOps": 2 * len(steps),
-            "removeCount": sum(1 for a in actions if a[0] == "remove"),
-            "moveCount": sum(1 for a in actions if a[0] in ("complete", "park")),
-            "parkCount": sum(1 for a in actions if a[0] == "park"),
-            "addCount": sum(1 for a in actions if a[0] == "add"),
-            "tempAddCount": sum(1 for a in actions if a[0] == "temp-add"),
+            "removeCount": sum(1 for a, _ in chain if a[0] == "remove"),
+            "moveCount": sum(1 for a, _ in chain if a[0] in ("complete", "park")),
+            "parkCount": sum(1 for a, _ in chain if a[0] == "park"),
+            "addCount": sum(1 for a, _ in chain if a[0] == "add"),
+            "tempAddCount": sum(1 for a, _ in chain if a[0] == "temp-add"),
             "tempCableCount": len(temporary),
             "newCableCount": len(new_cables),
             "reusedCableCount": len(unchanged) + len(moved) + len(recycled),

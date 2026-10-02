@@ -204,3 +204,10 @@ footer { text-align: center; color: var(--muted); font-size: 12px; padding: 20px
 .rewire-detail-cols { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }
 .rewire-detail-cols > div { flex: 1 1 320px; }
 .rewire-detail-cols h4, #rewire-step-detail h4 { color: var(--muted); font-size: 13px; margin: 10px 0 4px; }
+
+.micro-op { border: 1px solid var(--border, #2e3542); border-radius: 8px;
+  padding: 8px 12px; margin: 8px 0 14px; background: rgba(255,255,255,.02); }
+.micro-op-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.micro-op-head .micro-chip { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+.micro-op h5 { color: var(--muted); font-size: 12px; font-weight: 500; margin: 8px 0 2px; }
+.micro-op svg { max-width: 100%; height: auto; }

@@ -1422,7 +1422,7 @@ const REWIRE_ACTION_META = {
 function renderRewireResult(data) {
   let html = "";
   html += `<div class="banner ok">✅ 无中断改线方案已生成：共 <b>${data.stepCount}</b> 步
-    （${data.metrics.plugOps} 个插/拔动作），保护路由全程通声。</div>`;
+    （${data.metrics.plugOps} 个插/拔动作），每个插/拔动作后的中间快照上保护路由均通声。</div>`;
   if (data.solverNote) html += `<div class="banner warn">⚠️ ${esc(data.solverNote)}</div>`;
   if (data.feedbackLoops && data.feedbackLoops.length) {
     html += `<div class="banner warn">⚠️ 目标配置存在 ${data.feedbackLoops.length} 个反馈环路：<ul class="loop-list">` +
@@ -1442,7 +1442,7 @@ function renderRewireResult(data) {
 
   const pr = data.protectedRoutes.map((x) =>
     `路由 ${x.index + 1}（${x.source} → ${x.target}）`).join("、");
-  html += `<div class="result-card"><h3>保护路由（每一步后均校验通声）</h3>
+  html += `<div class="result-card"><h3>保护路由（每一个插/拔动作后的中间快照均校验通声）</h3>
     <p class="hint">${esc(pr) || "（未指定保护路由）"}</p></div>`;
 
   // 复用归类
@@ -1529,15 +1529,38 @@ function selectRewireStep(i) {
         ${p.path ? `<div class="hint">通路：${p.path.map((x) => esc(x.port)).join(" → ")}</div>` : ""}
       </div>`).join("")
     : '<p class="hint">未指定保护路由。</p>';
+
+  // 每个插/拔动作完成后的中间快照与保护通声校验（不再只看整步完成后）
+  const micro = (s.microOps && s.microOps.length === 2) ? s.microOps
+    : s.jackChanges.map((c) => ({
+        op: c.order || 1, jack: c.jack, port: c.port, change: c.change,
+        protected: s.protected, protectedAllAudible: s.protectedAllAudible,
+        snapshot: s.snapshot,
+      }));
+  const microHtml = micro.map((o, k) => {
+    const chips = o.protected.length
+      ? o.protected.map((p) => `<span class="prot-chip ${p.audible ? "on" : "off"}">
+           路由${p.routeNo} ${p.audible ? "✓通声" : "✗失声"}</span>`).join("")
+      : '<span class="hint">无保护路由</span>';
+    return `<div class="micro-op">
+      <div class="micro-op-head">
+        <span class="tag ${o.change === "plug" ? "ok" : "bad"}">动作 ${o.op} · ${o.change === "plug" ? "插入" : "拔下"}</span>
+        <b>${esc(o.jack)}</b><span class="hint">（${esc(o.port || "—")}）</span>
+        <span class="micro-chip">${chips}</span>
+      </div>
+      <h5>该动作完成后的前面板（保护路由${o.protectedAllAudible ? "全程通声" : "失声"}）</h5>
+      ${rewireSnapshotSvg(o.snapshot)}
+    </div>`;
+  }).join("");
+
   $("#rewire-step-detail").innerHTML = `
     <div class="step-detail-head"><b>${esc(s.summary)}</b></div>
     <div class="rewire-detail-cols">
-      <div><h4>插孔变更</h4><ul class="notes">${changes}</ul></div>
+      <div><h4>插孔变更（按实际操作次序）</h4><ul class="notes">${changes}</ul></div>
       <div><h4>受影响路由</h4><ul class="notes">${aff}</ul></div>
     </div>
-    <h4>保护路由状态</h4>${protDetail}
-    <h4>本步完成后的前面板</h4>
-    ${rewireSnapshotSvg(s.snapshot)}`;
+    <h4>每个插/拔动作后的中间快照与保护通声校验</h4>${microHtml}
+    <h4>本步完成后的保护路由状态</h4>${protDetail}`;
   const det = $("#rewire-step-detail");
   det.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -1554,7 +1577,12 @@ function rewireSnapshotSvg(snap) {
     pos[p.bottomJack] = { x: x0 + i * colW, y: botY };
   });
   const plugged = {};
-  cables.forEach((c) => { plugged[c.fromJack] = c; plugged[c.toJack] = c; });
+  const pending = {};
+  cables.forEach((c) => {
+    if (c.fromJack) plugged[c.fromJack] = c;
+    if (c.toJack) plugged[c.toJack] = c;
+  });
+  (snap.pendingPlugs || []).forEach((pp) => { pending[pp.jack] = pp; });
   let s = `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
   s += `<rect x="8" y="30" width="${width - 16}" height="140" rx="10" fill="#12151a" stroke="#2e3542"/>`;
   for (const p of pairs) {
@@ -1565,9 +1593,20 @@ function rewireSnapshotSvg(snap) {
     }
   }
   cables.forEach((c) => {
-    const a = pos[c.fromJack], b = pos[c.toJack];
     const color = c.temporary ? "#ffcf5c" : CABLE_COLORS[c.id % CABLE_COLORS.length];
     const dash = c.temporary ? ' stroke-dasharray="7,5"' : "";
+    if (c.dangling || !c.fromJack || !c.toJack) {
+      // 一端悬空：另一只手还没插/已拔下，画一段落到走线槽的悬空线头
+      const jk = c.fromJack || c.toJack;
+      const a = pos[jk];
+      const my = botY + 60;
+      s += `<path d="M ${a.x} ${a.y} Q ${a.x} ${my + 10} ${a.x + 26} ${my + 18}" `
+        + `fill="none" stroke="${color}" stroke-width="3.5" stroke-linecap="round"${dash}/>`;
+      s += `<circle cx="${a.x + 26}" cy="${my + 18}" r="5" fill="none" stroke="${color}" stroke-width="2.5"/>`;
+      s += `<text x="${a.x + 40}" y="${my + 22}" fill="${color}" font-size="11" font-weight="bold">悬空</text>`;
+      return;
+    }
+    const a = pos[c.fromJack], b = pos[c.toJack];
     const depth = 60 + Math.abs(a.x - b.x) * 0.28;
     const mx = (a.x + b.x) / 2, my = botY + depth;
     s += `<path d="M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}" fill="none" stroke="${color}" stroke-width="3.5"${dash}/>`;
@@ -1577,16 +1616,17 @@ function rewireSnapshotSvg(snap) {
     for (const [jack, port, dy] of [[p.topJack, p.topPort, -14], [p.bottomJack, p.bottomPort, 24]]) {
       const { x, y } = pos[jack];
       const owner = plugged[jack];
+      const pp = pending[jack];
       const fill = owner
         ? (owner.temporary ? "#ffcf5c" : CABLE_COLORS[owner.id % CABLE_COLORS.length])
-        : "#1d222b";
+        : (pp ? (pp.temporary ? "#ffcf5c" : CABLE_COLORS[pp.id % CABLE_COLORS.length]) : "#1d222b");
       s += `<circle cx="${x}" cy="${y}" r="9" fill="${fill}" stroke="#9aa4b2" stroke-width="1.5"/>`;
       s += `<text x="${x}" y="${y + dy}" fill="#9aa4b2" font-size="10" text-anchor="middle">${esc(port || "—")}</text>`;
       s += `<text x="${x + 14}" y="${y + 4}" fill="#e6e9ef" font-size="10">${esc(jack)}</text>`;
     }
     s += `<text x="${pos[p.topJack].x}" y="${botY + 40}" fill="#9aa4b2" font-size="10" text-anchor="middle">第${p.id}对</text>`;
   }
-  s += `<text x="20" y="${height - 12}" fill="#ffcf5c" font-size="11">黄色虚线＝临时跳线</text>`;
+  s += `<text x="20" y="${height - 12}" fill="#ffcf5c" font-size="11">黄色虚线＝临时跳线 · 空心线头＝悬空插头（插/拔中间瞬间）</text>`;
   s += `</svg>`;
   return s;
 }
