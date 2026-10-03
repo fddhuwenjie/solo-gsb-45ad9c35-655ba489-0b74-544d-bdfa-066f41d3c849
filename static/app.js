@@ -1422,7 +1422,7 @@ const REWIRE_ACTION_META = {
 function renderRewireResult(data) {
   let html = "";
   html += `<div class="banner ok">✅ 无中断改线方案已生成：共 <b>${data.stepCount}</b> 步
-    （${data.metrics.plugOps} 个插/拔动作），保护路由全程通声。</div>`;
+    （${data.metrics.plugOps} 个插/拔动作），保护路由在每个插/拔动作及其中间快照全程通声。</div>`;
   if (data.solverNote) html += `<div class="banner warn">⚠️ ${esc(data.solverNote)}</div>`;
   if (data.feedbackLoops && data.feedbackLoops.length) {
     html += `<div class="banner warn">⚠️ 目标配置存在 ${data.feedbackLoops.length} 个反馈环路：<ul class="loop-list">` +
@@ -1442,7 +1442,7 @@ function renderRewireResult(data) {
 
   const pr = data.protectedRoutes.map((x) =>
     `路由 ${x.index + 1}（${x.source} → ${x.target}）`).join("、");
-  html += `<div class="result-card"><h3>保护路由（每一步后均校验通声）</h3>
+  html += `<div class="result-card"><h3>保护路由（每个插/拔动作及其中间快照均校验通声）</h3>
     <p class="hint">${esc(pr) || "（未指定保护路由）"}</p></div>`;
 
   // 复用归类
@@ -1486,16 +1486,26 @@ function renderRewireResult(data) {
 
 function rewireStepHtml(s, i, total) {
   const meta = REWIRE_ACTION_META[s.action] || { cls: "ok", icon: "•" };
+  const chip = (label, ok, title) =>
+    `<span class="prot-chip ${ok ? "on" : "off"}" title="${esc(title)}">${label}</span>`;
   const prot = s.protected.length
-    ? s.protected.map((p) => `<span class="prot-chip ${p.audible ? "on" : "off"}"
-         title="${esc(p.source)} → ${esc(p.target)}${p.viaTemporary.length ? `（经临时跳线 ${p.viaTemporary.map((t) => "T" + t).join("、")}）` : ""}">
-         路由${p.routeNo} ${p.audible ? "✓通声" : "✗失声"}</span>`).join("")
+    ? s.protected.map((p) => chip(
+        `路由${p.routeNo} ${p.audible ? "✓通声" : "✗失声"}`, p.audible,
+        `${p.source} → ${p.target}${p.viaTemporary.length ? `（经临时跳线 ${p.viaTemporary.map((t) => "T" + t).join("、")}）` : ""}`))
+      .join("")
     : '<span class="hint">无保护路由</span>';
+  const mid = s.intermediate;
+  const midChip = mid && mid.protected.length
+    ? chip(`中间${mid.protectedAllAudible ? "✓" : "✗"}`,
+           mid.protectedAllAudible,
+           "两个插/拔动作之间的中间物理快照：" + mid.protected
+             .map((p) => `路由${p.routeNo} ${p.audible ? "通声" : "失声"}`).join("、"))
+    : "";
   return `<button class="rewire-step ${meta.cls}" id="rewire-step-btn-${i}" onclick="selectRewireStep(${i})">
     <span class="step-no">第 ${s.seq}/${total} 步</span>
     <span class="step-icon">${meta.icon}</span>
     <span class="step-title">${esc(s.actionLabel)}</span>
-    <span class="step-prot">${prot}</span>
+    <span class="step-prot">${midChip}${prot}</span>
   </button>`;
 }
 
@@ -1505,9 +1515,15 @@ function selectRewireStep(i) {
   document.querySelectorAll(".rewire-step").forEach((b, k) =>
     b.classList.toggle("active", k === i));
   const s = data.steps[i];
-  const changes = s.jackChanges.map((c) => `<li>
-    <span class="tag ${c.change === "plug" ? "ok" : "bad"}">${c.change === "plug" ? "插入" : "拔下"}</span>
-    插孔 <b>${esc(c.jack)}</b>（${esc(c.port || "—")}）</li>`).join("");
+  const changes = s.jackChanges.map((c, k) => {
+    const isMid = c.phase === "mid";
+    const tag = c.change === "plug"
+      ? (isMid ? '<span class="tag ok">① 先插入</span>' : '<span class="tag">② 后插入</span>')
+      : (isMid ? '<span class="tag bad">① 先拔下</span>' : '<span class="tag">② 后拔下</span>');
+    return `<li${isMid ? ' class="mid-change"' : ''}>${tag}
+      插孔 <b>${esc(c.jack)}</b>（${esc(c.port || "—")}）
+      ${isMid ? '<span class="hint">中间快照</span>' : '<span class="hint">本步完成</span>'}</li>`;
+  }).join("");
   const aff = s.affectedRoutes.length
     ? s.affectedRoutes.map((r) => {
         const badge = r.audibleBefore === r.audibleAfter
@@ -1520,26 +1536,52 @@ function selectRewireStep(i) {
           ${r.protected ? '<span class="tag warn">保护</span>' : ""}</li>`;
       }).join("")
     : '<li class="hint">无路由受本步影响。</li>';
-  const protDetail = s.protected.length
-    ? s.protected.map((p) => `<div class="route-block">
+  const protBlock = (title, arr, viaTemp) => arr.length
+    ? arr.map((p) => `<div class="route-block">
         <div class="route-title">路由 ${p.routeNo}：${esc(p.source)} → ${esc(p.target)}
-          <span class="tag ${p.audible ? "ok" : "bad"}">${p.audible ? "✓ 仍可用" : "✗ 失声"}</span>
-          ${p.viaTemporary.length ? `<span class="tag warn">经临时跳线 ${p.viaTemporary.map((t) => "T" + t).join("、")}</span>` : ""}
+          <span class="tag ${p.audible ? "ok" : "bad"}">${p.audible ? "✓ 通声" : "✗ 失声"}</span>
+          ${p.viaTemporary && p.viaTemporary.length
+            ? `<span class="tag warn">经临时跳线 ${p.viaTemporary.map((t) => "T" + t).join("、")}</span>` : ""}
         </div>
         ${p.path ? `<div class="hint">通路：${p.path.map((x) => esc(x.port)).join(" → ")}</div>` : ""}
       </div>`).join("")
     : '<p class="hint">未指定保护路由。</p>';
+  const mid = s.intermediate;
+  const midBanner = mid
+    ? `<div class="mid-banner ${mid.protectedAllAudible ? "ok" : "bad"}">
+         ① 第一个插/拔动作（${esc(mid.firstChange === "plug" ? "插入" : "拔下")}
+         ${esc(mid.firstJack)}）完成、② 尚未进行的<b>中间物理快照</b>：
+         保护路由 <b>${mid.protectedAllAudible ? "全部仍通声 ✓" : "存在失声 ✗"}</b>
+       </div>` : "";
   $("#rewire-step-detail").innerHTML = `
     <div class="step-detail-head"><b>${esc(s.summary)}</b></div>
     <div class="rewire-detail-cols">
-      <div><h4>插孔变更</h4><ul class="notes">${changes}</ul></div>
+      <div><h4>物理操作顺序（两个插/拔动作）</h4><ul class="notes">${changes}</ul></div>
       <div><h4>受影响路由</h4><ul class="notes">${aff}</ul></div>
     </div>
-    <h4>保护路由状态</h4>${protDetail}
-    <h4>本步完成后的前面板</h4>
-    ${rewireSnapshotSvg(s.snapshot)}`;
+    ${midBanner}
+    <h4>中间快照 · 保护路由状态</h4>
+    ${mid ? protBlock("mid", mid.protected) : '<p class="hint">无中间快照。</p>'}
+    <h4>本步完成后 · 保护路由状态</h4>
+    ${protBlock("post", s.protected)}
+    <div class="snap-toggle">
+      <button class="snap-btn active" id="snap-btn-mid" onclick="showRewireSnap(${i}, 'mid')">① 中间快照面板</button>
+      <button class="snap-btn" id="snap-btn-post" onclick="showRewireSnap(${i}, 'post')">② 本步完成后面板</button>
+    </div>
+    <div id="rewire-snap-mid"><h4>① 中间快照前面板（一端已拔 / 首端已插，半插跳线为半透明）</h4>
+      ${mid ? rewireSnapshotSvg(mid.snapshot) : ""}</div>
+    <div id="rewire-snap-post" hidden><h4>② 本步完成后的前面板</h4>
+      ${rewireSnapshotSvg(s.snapshot)}</div>`;
   const det = $("#rewire-step-detail");
   det.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function showRewireSnap(i, which) {
+  const midOn = which === "mid";
+  $("#rewire-snap-mid").hidden = !midOn;
+  $("#rewire-snap-post").hidden = midOn;
+  $("#snap-btn-mid").classList.toggle("active", midOn);
+  $("#snap-btn-post").classList.toggle("active", !midOn);
 }
 
 function rewireSnapshotSvg(snap) {
@@ -1554,7 +1596,19 @@ function rewireSnapshotSvg(snap) {
     pos[p.bottomJack] = { x: x0 + i * colW, y: botY };
   });
   const plugged = {};
-  cables.forEach((c) => { plugged[c.fromJack] = c; plugged[c.toJack] = c; });
+  const plugSet = new Set(snap.plugs || []);
+  cables.forEach((c) => {
+    // 中间快照半插跳线只“占有”实际仍插着的一端；另一端悬空不画占用
+    if (c.partial) {
+      const tIn = !snap.plugs || plugSet.has(c.fromJack);
+      const bIn = !snap.plugs || plugSet.has(c.toJack);
+      if (tIn) plugged[c.fromJack] = c;
+      if (bIn) plugged[c.toJack] = c;
+    } else {
+      plugged[c.fromJack] = c;
+      plugged[c.toJack] = c;
+    }
+  });
   let s = `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
   s += `<rect x="8" y="30" width="${width - 16}" height="140" rx="10" fill="#12151a" stroke="#2e3542"/>`;
   for (const p of pairs) {
@@ -1566,12 +1620,24 @@ function rewireSnapshotSvg(snap) {
   }
   cables.forEach((c) => {
     const a = pos[c.fromJack], b = pos[c.toJack];
-    const color = c.temporary ? "#ffcf5c" : CABLE_COLORS[c.id % CABLE_COLORS.length];
-    const dash = c.temporary ? ' stroke-dasharray="7,5"' : "";
+    const color = c.temporary ? "#ffcf5c" : CABLE_COLORS[Math.abs(c.id) % CABLE_COLORS.length];
+    // 中间快照的半插跳线：一端实际未插接（plugs 中没有），画半透明虚线，
+    // 悬空端偏移到插孔外侧，提示“刚拔下 / 尚未插入”。用 plugSet 而非
+    // plugged（另一根在役跳线可能恰好占有同名插孔）
+    const danglingT = c.partial && !plugSet.has(c.fromJack);
+    const danglingB = c.partial && !plugSet.has(c.toJack);
+    const ax = danglingT ? a.x - 22 : a.x;
+    const ay = danglingT ? a.y - 26 : a.y;
+    const bx = danglingB ? b.x + 22 : b.x;
+    const by = danglingB ? b.y + 26 : b.y;
+    const dash = c.partial ? ' stroke-dasharray="4,6" opacity="0.45"'
+      : (c.temporary ? ' stroke-dasharray="7,5"' : "");
     const depth = 60 + Math.abs(a.x - b.x) * 0.28;
-    const mx = (a.x + b.x) / 2, my = botY + depth;
-    s += `<path d="M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}" fill="none" stroke="${color}" stroke-width="3.5"${dash}/>`;
-    s += `<text x="${mx}" y="${my * 0.62}" fill="${color}" font-size="12" text-anchor="middle" font-weight="bold">${c.temporary ? "T" : "#"}${c.id}</text>`;
+    const mx = (ax + bx) / 2, my = by + depth;
+    s += `<path d="M ${ax} ${ay} Q ${mx} ${my} ${bx} ${by}" fill="none" stroke="${color}" stroke-width="3.5"${dash}/>`;
+    if (!c.partial) {
+      s += `<text x="${mx}" y="${my * 0.62}" fill="${color}" font-size="12" text-anchor="middle" font-weight="bold">${c.temporary ? "T" : "#"}${c.id}</text>`;
+    }
   });
   for (const p of pairs) {
     for (const [jack, port, dy] of [[p.topJack, p.topPort, -14], [p.bottomJack, p.bottomPort, 24]]) {

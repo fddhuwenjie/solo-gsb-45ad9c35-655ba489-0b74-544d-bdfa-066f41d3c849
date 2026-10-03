@@ -204,3 +204,15 @@ footer { text-align: center; color: var(--muted); font-size: 12px; padding: 20px
 .rewire-detail-cols { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }
 .rewire-detail-cols > div { flex: 1 1 320px; }
 .rewire-detail-cols h4, #rewire-step-detail h4 { color: var(--muted); font-size: 13px; margin: 10px 0 4px; }
+
+/* 中间快照（两个插/拔动作之间） */
+.mid-banner { border-radius: 8px; padding: 9px 14px; margin: 10px 0 6px; font-size: 13.5px;
+  background: rgba(62,207,142,.1); border: 1px solid var(--green); color: var(--text); }
+.mid-banner.bad { background: rgba(255,107,107,.1); border-color: var(--red); }
+ul.notes li.mid-change { border-left: 3px solid var(--accent); padding-left: 8px;
+  list-style-position: inside; }
+.snap-toggle { display: flex; gap: 8px; margin: 14px 0 6px; }
+.snap-btn { padding: 6px 16px; font-size: 13px; }
+.snap-btn.active { background: var(--accent); border-color: var(--accent);
+  color: #0b1521; font-weight: 600; }
+#rewire-snap-mid, #rewire-snap-post { margin-bottom: 10px; }
